@@ -1,3 +1,1 @@
-fastapi
-httpx
-cryptography
+# No dependencies needed - using standard library only
