@@ -1,100 +1,106 @@
-import os
+from http.server import BaseHTTPRequestHandler
 import json
-import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-
-app = FastAPI()
+import os
+import urllib.request
 
 FEISHU_APP_ID = os.getenv('FEISHU_APP_ID', '')
 FEISHU_APP_SECRET = os.getenv('FEISHU_APP_SECRET', '')
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
 
-@app.api_route("/api", methods=["GET", "POST"])
-@app.api_route("/", methods=["GET", "POST"])
-async def handler(request: Request):
-    # GET 请求 - 健康检查
-    if request.method == "GET":
-        return {"status": "ok", "service": "im-bridge"}
+class handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({"status": "ok", "service": "im-bridge"}).encode())
 
-    # POST 请求 - 解析 JSON
-    try:
-        data = await request.json()
-    except Exception:
-        return {"code": 0}
-
-    # URL 验证 - 飞书验证时立即返回 challenge
-    if data.get('type') == 'url_verification':
-        return JSONResponse(content={"challenge": data.get('challenge', '')})
-
-    # 处理消息事件
-    header = data.get('header', {})
-    if header.get('event_type') == 'im.message.receive_v1':
-        event = data.get('event', {})
-        msg = event.get('message', {})
-        chat_id = msg.get('chat_id', '')
-
-        # 解析消息内容
+    def do_POST(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length)
+        
         try:
-            content = json.loads(msg.get('content', '{}'))
-        except json.JSONDecodeError:
-            content = {}
+            data = json.loads(body)
+        except:
+            self._respond({"code": 0})
+            return
 
-        text = content.get('text', '')
+        # URL 验证
+        if data.get('type') == 'url_verification':
+            self._respond({"challenge": data.get('challenge', '')})
+            return
 
-        # 有消息内容时处理
-        if text and chat_id:
+        # 处理消息
+        header = data.get('header', {})
+        if header.get('event_type') == 'im.message.receive_v1':
+            event = data.get('event', {})
+            msg = event.get('message', {})
+            chat_id = msg.get('chat_id', '')
+            
             try:
-                async with httpx.AsyncClient() as client:
-                    # 1. 获取飞书 access token
-                    token_resp = await client.post(
-                        'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
-                        json={
-                            'app_id': FEISHU_APP_ID,
-                            'app_secret': FEISHU_APP_SECRET
-                        },
-                        timeout=10.0
-                    )
-                    token = token_resp.json().get('tenant_access_token', '')
+                content = json.loads(msg.get('content', '{}'))
+            except:
+                content = {}
+            
+            text = content.get('text', '')
 
-                    if not token:
-                        return {"code": 0}
+            if text and chat_id:
+                try:
+                    # 获取飞书 token
+                    token = self._get_feishu_token()
+                    if token:
+                        # 调用 Claude
+                        reply = self._call_claude(text)
+                        # 发送回复
+                        self._send_feishu_message(token, chat_id, reply)
+                except:
+                    pass
 
-                    # 2. 调用 Claude API
-                    claude_resp = await client.post(
-                        'https://api.anthropic.com/v1/messages',
-                        headers={
-                            'x-api-key': ANTHROPIC_API_KEY,
-                            'anthropic-version': '2023-06-01',
-                            'content-type': 'application/json'
-                        },
-                        json={
-                            'model': 'claude-sonnet-4-20250514',
-                            'max_tokens': 4096,
-                            'messages': [{'role': 'user', 'content': text}]
-                        },
-                        timeout=55.0
-                    )
+        self._respond({"code": 0})
 
-                    claude_data = claude_resp.json()
-                    reply = claude_data.get('content', [{}])[0].get('text', '抱歉，处理失败')
+    def _respond(self, data):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
 
-                    # 3. 发送回复到飞书
-                    await client.post(
-                        'https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id',
-                        headers={
-                            'Authorization': f'Bearer {token}',
-                            'Content-Type': 'application/json'
-                        },
-                        json={
-                            'receive_id': chat_id,
-                            'msg_type': 'text',
-                            'content': json.dumps({'text': reply})
-                        },
-                        timeout=10.0
-                    )
+    def _get_feishu_token(self):
+        req = urllib.request.Request(
+            'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
+            data=json.dumps({'app_id': FEISHU_APP_ID, 'app_secret': FEISHU_APP_SECRET}).encode(),
+            headers={'Content-Type': 'application/json'}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read()).get('tenant_access_token', '')
 
-            except Exception:
-                pass
+    def _call_claude(self, text):
+        req = urllib.request.Request(
+            'https://api.anthropic.com/v1/messages',
+            data=json.dumps({
+                'model': 'claude-sonnet-4-20250514',
+                'max_tokens': 4096,
+                'messages': [{'role': 'user', 'content': text}]
+            }).encode(),
+            headers={
+                'Content-Type': 'application/json',
+                'x-api-key': ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01'
+            }
+        )
+        with urllib.request.urlopen(req, timeout=55) as resp:
+            data = json.loads(resp.read())
+            return data.get('content', [{}])[0].get('text', '处理失败')
 
-    return {"code": 0}
+    def _send_feishu_message(self, token, chat_id, text):
+        req = urllib.request.Request(
+            'https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id',
+            data=json.dumps({
+                'receive_id': chat_id,
+                'msg_type': 'text',
+                'content': json.dumps({'text': text})
+            }).encode(),
+            headers={
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {token}'
+            }
+        )
+        urllib.request.urlopen(req, timeout=10)
