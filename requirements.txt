@@ -1,18 +1,3 @@
-# IM Bridge Dependencies
-
-# Core
-anthropic>=0.40.0
-httpx>=0.27.0
-
-# Discord
-discord.py>=2.3.0
-
-# Crypto (for Feishu encryption)
-cryptography>=41.0.0
-
-# Utilities
-python-dotenv>=1.0.0
-
-# Optional: FastAPI for webhook server
-fastapi>=0.115.0
-uvicorn>=0.32.0
+fastapi
+httpx
+cryptography
